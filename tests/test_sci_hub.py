@@ -4,17 +4,23 @@ import tempfile
 import shutil
 import os
 import requests
-from paper_search_mcp.academic_platforms.sci_hub import SciHubFetcher
+from paper_search_mcp.academic_platforms.sci_hub import (
+    DEFAULT_MIRRORS,
+    SciHubFetcher,
+    SciHubRateLimitedError,
+    SciHubUnavailableError,
+)
 
 
 def check_sci_hub_accessible():
-    """Check if Sci-Hub is accessible"""
-    try:
-        # Test with a simple request to see if sci-hub responds
-        response = requests.get("https://sci-hub.se", timeout=10)
-        return response.status_code == 200
-    except:
-        return False
+    """Check whether any configured Sci-Hub mirror responds."""
+    for mirror in DEFAULT_MIRRORS:
+        try:
+            if requests.get(mirror, timeout=10).status_code == 200:
+                return True
+        except requests.RequestException:
+            continue
+    return False
 
 
 class TestSciHubFetcher(unittest.TestCase):
@@ -36,14 +42,16 @@ class TestSciHubFetcher(unittest.TestCase):
 
     def test_init(self):
         """Test initialization of SciHubFetcher"""
-        self.assertEqual(self.fetcher.base_url, "https://sci-hub.se")
+        self.assertEqual(list(self.fetcher.mirrors), [m.rstrip("/") for m in DEFAULT_MIRRORS])
+        self.assertEqual(self.fetcher.base_url, self.fetcher.mirrors[0])
         self.assertTrue(os.path.exists(self.test_dir))
         self.assertIsNotNone(self.fetcher.session)
 
-    def test_init_custom_url(self):
-        """Test initialization with custom URL"""
+    def test_init_custom_url_pins_to_one_mirror(self):
+        """An explicit base_url disables mirror failover."""
         custom_fetcher = SciHubFetcher(base_url="https://sci-hub.ru/", output_dir=self.test_dir)
         self.assertEqual(custom_fetcher.base_url, "https://sci-hub.ru")
+        self.assertEqual(custom_fetcher.mirrors, ["https://sci-hub.ru"])
 
     def test_download_pdf_empty_query(self):
         """Test download with empty query"""
@@ -138,10 +146,19 @@ class TestSciHubFetcher(unittest.TestCase):
             "10.1073/pnas.1320040111",  # PNAS paper
         ]
         
+        rate_limited = False
         for doi in test_dois:
             print(f"\nTesting direct URL extraction for DOI: {doi}")
-            result = self.fetcher._get_direct_url(doi)
-            
+            try:
+                result = self.fetcher._get_direct_url(doi)
+            except SciHubRateLimitedError:
+                rate_limited = True
+                print(f"Captcha-walled for {doi}")
+                continue
+            except SciHubUnavailableError:
+                print(f"Not in Sci-Hub's database: {doi}")
+                continue
+
             if result:
                 self.assertIsInstance(result, str)
                 # Should be a URL
@@ -149,9 +166,10 @@ class TestSciHubFetcher(unittest.TestCase):
                 print(f"Direct URL found: {result}")
                 break  # Stop after first success
             else:
-                print(f"No direct URL found for {doi} (may be blocked)")
-        
-        # Note: This test may not assert success due to Sci-Hub blocking
+                print(f"No direct URL found for {doi}")
+        else:
+            if rate_limited:
+                self.skipTest("Sci-Hub captcha-walled this client for every test DOI")
 
     def test_session_headers(self):
         """Test that session has proper headers"""

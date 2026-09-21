@@ -122,7 +122,6 @@ class UnpaywallResolver:
         pdf_url = best_location.get("url_for_pdf") or self.resolve_best_pdf_url(normalized_doi) or ""
 
         abstract = ""
-        is_oa = bool(data.get("is_oa"))
 
         return Paper(
             paper_id=f"unpaywall:{normalized_doi}",
@@ -135,7 +134,7 @@ class UnpaywallResolver:
             url=landing_url,
             source="unpaywall",
             extra={
-                "is_oa": is_oa,
+                # `is_oa` is omitted: it no longer predicts whether a fetch will succeed.
                 "oa_status": data.get("oa_status", ""),
                 "journal_name": data.get("journal_name", ""),
                 "publisher": data.get("publisher", ""),

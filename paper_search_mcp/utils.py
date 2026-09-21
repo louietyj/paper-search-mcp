@@ -1,5 +1,9 @@
 import re
 
+# Bot walls, captcha interstitials and error stubs are a few KB; a real article is not.
+MIN_PDF_BYTES = 20_000
+
+
 def extract_doi(text: str) -> str:
     """Extract DOI from arbitrary text or URL if present."""
     if not text:

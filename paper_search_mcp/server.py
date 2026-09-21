@@ -34,6 +34,7 @@ from .academic_platforms.ssrn import SSRNSearcher
 from .academic_platforms.unpaywall import UnpaywallResolver, UnpaywallSearcher
 from .academic_platforms.zenodo import ZenodoSearcher
 from .config import get_env
+from .utils import MIN_PDF_BYTES
 
 # Initialize MCP server
 mcp = FastMCP("paper_search_server")
@@ -253,9 +254,18 @@ async def _download_from_url(pdf_url: str, save_path: str, filename_hint: str = 
             return None
 
         content_type = (response.headers.get("content-type") or "").lower()
-        is_pdf = "pdf" in content_type or response.content.startswith(b"%PDF") or pdf_url.lower().endswith(".pdf")
-        if not is_pdf:
-            logger.warning("Resolved URL is not a PDF candidate: %s (content-type=%s)", pdf_url, content_type)
+        if not response.content.startswith(b"%PDF"):
+            logger.warning(
+                "Resolved URL did not return PDF bytes: %s (content-type=%s, first bytes=%r)",
+                pdf_url, content_type, response.content[:16],
+            )
+            return None
+
+        if len(response.content) < MIN_PDF_BYTES:
+            logger.warning(
+                "Resolved URL returned an implausibly small PDF (%d bytes): %s",
+                len(response.content), pdf_url,
+            )
             return None
 
         with open(output_path, "wb") as file_obj:
@@ -265,6 +275,30 @@ async def _download_from_url(pdf_url: str, save_path: str, filename_hint: str = 
     except Exception as exc:
         logger.warning("Direct URL download failed for %s: %s", pdf_url, exc)
         return None
+
+
+def _normalize_doi(doi: str) -> str:
+    normalized = (doi or "").strip().lower()
+    normalized = re.sub(r"^(?:https?://)?(?:dx\.)?doi\.org/", "", normalized)
+    return re.sub(r"^doi:\s*", "", normalized)
+
+
+def _normalize_title(title: str) -> str:
+    return re.sub(r"[^a-z0-9]+", " ", (title or "").lower()).strip()
+
+
+def _is_same_paper(paper: Any, wanted_doi: str, wanted_title: str) -> bool:
+    """Guard against repositories returning a topically similar but different paper.
+
+    A DOI match is authoritative; a bare title only ever gets an exact match.
+    """
+    if wanted_doi:
+        return _normalize_doi(str(getattr(paper, "doi", "") or "")) == wanted_doi
+
+    if wanted_title:
+        return _normalize_title(str(getattr(paper, "title", "") or "")) == wanted_title
+
+    return False
 
 
 async def _try_repository_fallback(doi: str, title: str, save_path: str) -> tuple[Optional[str], str]:
@@ -280,7 +314,10 @@ async def _try_repository_fallback(doi: str, title: str, save_path: str) -> tupl
     if not query_candidates:
         return None, "no DOI/title provided for repository fallback"
 
+    wanted_doi = _normalize_doi(doi)
+    wanted_title = _normalize_title(title)
     repository_errors: List[str] = []
+    rejected_mismatches = 0
 
     for repo_name, searcher in repository_searchers:
         for query in query_candidates:
@@ -298,11 +335,24 @@ async def _try_repository_fallback(doi: str, title: str, save_path: str) -> tupl
                 if not pdf_url:
                     continue
 
+                if not _is_same_paper(paper, wanted_doi, wanted_title):
+                    rejected_mismatches += 1
+                    logger.debug(
+                        "Discarding %s result %r (doi=%r): does not match requested doi=%r title=%r",
+                        repo_name, getattr(paper, "title", ""), getattr(paper, "doi", ""), doi, title,
+                    )
+                    continue
+
                 raw_paper_id = getattr(paper, "paper_id", "")
                 paper_id = str(raw_paper_id or query).strip()
                 downloaded = await _download_from_url(pdf_url, save_path, f"{repo_name}_{paper_id}")
                 if downloaded:
                     return downloaded, ""
+
+    if rejected_mismatches:
+        repository_errors.append(
+            f"{rejected_mismatches} result(s) discarded as a different paper than requested"
+        )
 
     return None, "; ".join(repository_errors)
 
@@ -834,22 +884,22 @@ async def download_crossref(paper_id: str, save_path: str = "./downloads") -> st
 async def download_scihub(
     identifier: str,
     save_path: str = "./downloads",
-    base_url: str = "https://sci-hub.se",
+    base_url: str = "",
 ) -> str:
-    """Download paper PDF via Sci-Hub (optional fallback connector).
+    """Download paper PDF via Sci-Hub.
 
     Args:
         identifier: DOI, title, PMID, or paper URL.
         save_path: Directory to save the PDF.
-        base_url: Sci-Hub mirror URL.
+        base_url: Pin to one Sci-Hub mirror. Empty tries all configured mirrors.
     Returns:
         Downloaded PDF path on success; error message on failure.
     """
-    fetcher = SciHubFetcher(base_url=base_url, output_dir=save_path)
+    fetcher = SciHubFetcher(base_url=base_url or None, output_dir=save_path)
     result = await asyncio.to_thread(fetcher.download_pdf, identifier)
     if result:
         return result
-    return "Sci-Hub download failed. Try DOI first, then title, or change mirror URL."
+    return f"Sci-Hub download failed: {fetcher.last_failure_reason}."
 
 
 @mcp.tool()
@@ -859,10 +909,9 @@ async def download_with_fallback(
     doi: str = "",
     title: str = "",
     save_path: str = "./downloads",
-    use_scihub: bool = False,
-    scihub_base_url: str = "https://sci-hub.se",
+    scihub_base_url: str = "",
 ) -> str:
-    """Try source-native download, OA repositories, Unpaywall, then optional Sci-Hub.
+    """Try source-native download, OA repositories, Unpaywall, then Sci-Hub.
 
     Args:
         source: Source name (arxiv, biorxiv, medrxiv, iacr, semantic, crossref, pubmed, pmc, core, europepmc, citeseerx, doaj, base, zenodo, hal, ssrn).
@@ -870,8 +919,7 @@ async def download_with_fallback(
         doi: Optional DOI used for repository/unpaywall/Sci-Hub fallback.
         title: Optional title used for repository/Sci-Hub fallback when DOI is unavailable.
         save_path: Directory to save downloaded files.
-        use_scihub: Whether to fallback to Sci-Hub after OA attempts fail. Disabled by default.
-        scihub_base_url: Sci-Hub mirror URL for fallback.
+        scihub_base_url: Pin to one Sci-Hub mirror. Empty tries all configured mirrors.
     Returns:
         Download path on success or explanatory error message.
     """
@@ -933,15 +981,13 @@ async def download_with_fallback(
     else:
         attempt_errors.append("unpaywall: DOI not provided")
 
-    if not use_scihub:
-        return "Download failed after OA fallback chain. Details: " + " | ".join(attempt_errors)
-
     fallback_identifier = (doi or "").strip() or (title or "").strip() or paper_id
-    fetcher = SciHubFetcher(base_url=scihub_base_url, output_dir=save_path)
+    fetcher = SciHubFetcher(base_url=scihub_base_url or None, output_dir=save_path)
     fallback_result = await asyncio.to_thread(fetcher.download_pdf, fallback_identifier)
     if fallback_result:
         return fallback_result
 
+    attempt_errors.append(f"scihub: {fetcher.last_failure_reason}")
     return "Download failed after OA fallback chain and Sci-Hub fallback. Details: " + " | ".join(attempt_errors)
 
 

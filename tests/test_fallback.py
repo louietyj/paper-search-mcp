@@ -6,11 +6,11 @@ from paper_search_mcp import server
 
 
 class TestDownloadWithFallback(unittest.TestCase):
-    def test_scihub_is_disabled_by_default(self):
+    def test_scihub_is_always_attempted(self):
         with patch.object(server.arxiv_searcher, "download_pdf", side_effect=Exception("primary failed")), \
              patch("paper_search_mcp.server._try_repository_fallback", new=AsyncMock(return_value=(None, "repo failed"))), \
              patch.object(server.unpaywall_resolver, "resolve_best_pdf_url", return_value=None), \
-             patch("paper_search_mcp.server.SciHubFetcher.download_pdf", side_effect=AssertionError("Sci-Hub should not be called")):
+             patch("paper_search_mcp.server.SciHubFetcher.download_pdf", return_value="/tmp/scihub.pdf") as scihub:
             result = asyncio.run(
                 server.download_with_fallback(
                     source="arxiv",
@@ -20,7 +20,20 @@ class TestDownloadWithFallback(unittest.TestCase):
                 )
             )
 
-        self.assertIn("OA fallback chain", result)
+        self.assertEqual(result, "/tmp/scihub.pdf")
+        scihub.assert_called_once_with("10.1000/test")
+
+    def test_scihub_falls_back_to_title_without_a_doi(self):
+        with patch.object(server.arxiv_searcher, "download_pdf", side_effect=Exception("primary failed")), \
+             patch("paper_search_mcp.server._try_repository_fallback", new=AsyncMock(return_value=(None, "repo failed"))), \
+             patch("paper_search_mcp.server.SciHubFetcher.download_pdf", return_value="/tmp/scihub.pdf") as scihub:
+            asyncio.run(
+                server.download_with_fallback(
+                    source="arxiv", paper_id="1234.5678", doi="", title="a paper title"
+                )
+            )
+
+        scihub.assert_called_once_with("a paper title")
 
     def test_repository_fallback_before_scihub(self):
         with patch.object(server.arxiv_searcher, "download_pdf", side_effect=Exception("primary failed")), \
@@ -32,7 +45,6 @@ class TestDownloadWithFallback(unittest.TestCase):
                     paper_id="1234.5678",
                     doi="10.1000/test",
                     title="test",
-                    use_scihub=True,
                 )
             )
             self.assertEqual(result, "/tmp/repo.pdf")
@@ -48,25 +60,26 @@ class TestDownloadWithFallback(unittest.TestCase):
                     paper_id="1234.5678",
                     doi="10.1000/test",
                     title="test",
-                    use_scihub=True,
                 )
             )
             self.assertEqual(result, "/tmp/unpaywall.pdf")
 
-    def test_no_scihub_returns_oa_chain_error(self):
+    def test_error_lists_every_attempt_when_scihub_also_fails(self):
         with patch.object(server.arxiv_searcher, "download_pdf", side_effect=Exception("primary failed")), \
              patch("paper_search_mcp.server._try_repository_fallback", new=AsyncMock(return_value=(None, "repo failed"))), \
-             patch.object(server.unpaywall_resolver, "resolve_best_pdf_url", return_value=None):
+             patch.object(server.unpaywall_resolver, "resolve_best_pdf_url", return_value=None), \
+             patch("paper_search_mcp.server.SciHubFetcher.download_pdf", return_value=None):
             result = asyncio.run(
                 server.download_with_fallback(
                     source="arxiv",
                     paper_id="1234.5678",
                     doi="10.1000/test",
                     title="test",
-                    use_scihub=False,
                 )
             )
-            self.assertIn("OA fallback chain", result)
+            self.assertIn("Sci-Hub", result)
+            self.assertIn("repo failed", result)
+            self.assertIn("primary failed", result)
 
 
 class TestRepositoryFallbackNumericPaperId(unittest.TestCase):
@@ -78,6 +91,8 @@ class TestRepositoryFallbackNumericPaperId(unittest.TestCase):
         class FakePaper:
             pdf_url = "https://example.org/oa.pdf"
             paper_id = 12345  # int, not str — caused 'int' object has no attribute 'strip'
+            doi = "10.1000/test"  # must match the request to clear the identity check
+            title = "some title"
 
         fake_searcher = type(
             "S", (), {"search": staticmethod(lambda q, max_results=3: [FakePaper()])}

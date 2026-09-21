@@ -82,6 +82,9 @@ class TestUnpaywallResolver(unittest.TestCase):
             self.assertEqual(paper.pdf_url, "https://example.org/paper.pdf")
             self.assertEqual(paper.authors, ["Alice Example"])
             self.assertEqual(paper.published_date, datetime(2024, 1, 15))
+            # OA status no longer predicts fetchability, so it is not surfaced.
+            self.assertNotIn("is_oa", paper.extra)
+            self.assertEqual(paper.extra["oa_status"], "gold")
 
 
 if __name__ == "__main__":
